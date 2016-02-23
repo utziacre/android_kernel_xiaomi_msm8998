@@ -139,26 +139,31 @@ static __le32 ext4_xattr_block_csum(struct inode *inode,
 }
 
 static int ext4_xattr_block_csum_verify(struct inode *inode,
-					struct buffer_head *bh)
+					sector_t block_nr,
+					struct ext4_xattr_header *hdr)
 {
-	struct ext4_xattr_header *hdr = BHDR(bh);
-	int ret = 1;
-
-	if (ext4_has_metadata_csum(inode->i_sb)) {
-		lock_buffer(bh);
-		ret = (hdr->h_checksum == ext4_xattr_block_csum(inode,
-							bh->b_blocknr, hdr));
-		unlock_buffer(bh);
-	}
-	return ret;
+	if (ext4_has_metadata_csum(inode->i_sb) &&
+	    (hdr->h_checksum != ext4_xattr_block_csum(inode, block_nr, hdr)))
+		return 0;
+	return 1;
 }
 
 static void ext4_xattr_block_csum_set(struct inode *inode,
-				      struct buffer_head *bh)
+				      sector_t block_nr,
+				      struct ext4_xattr_header *hdr)
 {
-	if (ext4_has_metadata_csum(inode->i_sb))
-		BHDR(bh)->h_checksum = ext4_xattr_block_csum(inode,
-						bh->b_blocknr, BHDR(bh));
+	if (!ext4_has_metadata_csum(inode->i_sb))
+		return;
+
+	hdr->h_checksum = ext4_xattr_block_csum(inode, block_nr, hdr);
+}
+
+static inline int ext4_handle_dirty_xattr_block(handle_t *handle,
+						struct inode *inode,
+						struct buffer_head *bh)
+{
+	ext4_xattr_block_csum_set(inode, bh->b_blocknr, BHDR(bh));
+	return ext4_handle_dirty_metadata(handle, inode, bh);
 }
 
 static inline const struct xattr_handler *
@@ -221,7 +226,7 @@ ext4_xattr_check_block(struct inode *inode, struct buffer_head *bh)
 	if (buffer_verified(bh))
 		return 0;
 
-	if (!ext4_xattr_block_csum_verify(inode, bh))
+	if (!ext4_xattr_block_csum_verify(inode, bh->b_blocknr, BHDR(bh)))
 		return -EFSBADCRC;
 	error = ext4_xattr_check_names(BFIRST(bh), bh->b_data + bh->b_size,
 				       bh->b_data);
@@ -561,6 +566,8 @@ static void
 ext4_xattr_release_block(handle_t *handle, struct inode *inode,
 			 struct buffer_head *bh)
 {
+	struct mb_cache *ext4_mb_cache = EXT4_GET_MB_CACHE(inode);
+	u32 hash, ref;
 	int error = 0;
 
 	BUFFER_TRACE(bh, "get_write_access");
@@ -569,40 +576,51 @@ ext4_xattr_release_block(handle_t *handle, struct inode *inode,
 		goto out;
 
 	lock_buffer(bh);
-	if (BHDR(bh)->h_refcount == cpu_to_le32(1)) {
-		__u32 hash = le32_to_cpu(BHDR(bh)->h_hash);
-
+	hash = le32_to_cpu(BHDR(bh)->h_hash);
+	ref = le32_to_cpu(BHDR(bh)->h_refcount);
+	if (ref == 1) {
 		ea_bdebug(bh, "refcount now=0; freeing");
 		/*
 		 * This must happen under buffer lock for
 		 * ext4_xattr_block_set() to reliably detect freed block
 		 */
-		mb_cache_entry_delete_block(EXT4_GET_MB_CACHE(inode), hash,
-					    bh->b_blocknr);
+		mb_cache_entry_delete_block(ext4_mb_cache, hash, bh->b_blocknr);
 		get_bh(bh);
 		unlock_buffer(bh);
 		ext4_free_blocks(handle, inode, bh, 0, 1,
 				 EXT4_FREE_BLOCKS_METADATA |
 				 EXT4_FREE_BLOCKS_FORGET);
 	} else {
-		le32_add_cpu(&BHDR(bh)->h_refcount, -1);
+		ref--;
+		BHDR(bh)->h_refcount = cpu_to_le32(ref);
+		if (ref == EXT4_XATTR_REFCOUNT_MAX - 1) {
+			struct mb_cache_entry *ce;
 
-		ext4_xattr_block_csum_set(inode, bh);
+			ce = mb_cache_entry_get(ext4_mb_cache, hash,
+						bh->b_blocknr);
+			if (ce) {
+				ce->e_reusable = 1;
+				mb_cache_entry_put(ext4_mb_cache, ce);
+			}
+		}
+
 		/*
 		 * Beware of this ugliness: Releasing of xattr block references
 		 * from different inodes can race and so we have to protect
 		 * from a race where someone else frees the block (and releases
 		 * its journal_head) before we are done dirtying the buffer. In
 		 * nojournal mode this race is harmless and we actually cannot
-		 * call ext4_handle_dirty_metadata() with locked buffer as
+		 * call ext4_handle_dirty_xattr_block() with locked buffer as
 		 * that function can call sync_dirty_buffer() so for that case
 		 * we handle the dirtying after unlocking the buffer.
 		 */
 		if (ext4_handle_valid(handle))
-			error = ext4_handle_dirty_metadata(handle, inode, bh);
+			error = ext4_handle_dirty_xattr_block(handle, inode,
+							      bh);
 		unlock_buffer(bh);
 		if (!ext4_handle_valid(handle))
-			error = ext4_handle_dirty_metadata(handle, inode, bh);
+			error = ext4_handle_dirty_xattr_block(handle, inode,
+							      bh);
 		if (IS_SYNC(inode))
 			ext4_handle_sync(handle);
 		dquot_free_block(inode, EXT4_C2B(EXT4_SB(inode->i_sb), 1));
@@ -836,14 +854,13 @@ ext4_xattr_block_set(handle_t *handle, struct inode *inode,
 					ext4_xattr_rehash(header(s->base),
 							  s->here);
 			}
-			ext4_xattr_block_csum_set(inode, bs->bh);
 			unlock_buffer(bs->bh);
 			if (error == -EFSCORRUPTED)
 				goto bad_block;
 			if (!error)
-				error = ext4_handle_dirty_metadata(handle,
-								   inode,
-								   bs->bh);
+				error = ext4_handle_dirty_xattr_block(handle,
+								      inode,
+								      bs->bh);
 			if (error)
 				goto cleanup;
 			goto inserted;
@@ -893,6 +910,8 @@ inserted:
 			if (new_bh == bs->bh)
 				ea_bdebug(new_bh, "keeping");
 			else {
+				u32 ref;
+
 				/* The old block is released after updating
 				   the inode. */
 				error = dquot_alloc_block(inode,
@@ -907,15 +926,18 @@ inserted:
 				lock_buffer(new_bh);
 				/*
 				 * We have to be careful about races with
-				 * freeing or rehashing of xattr block. Once we
-				 * hold buffer lock xattr block's state is
-				 * stable so we can check whether the block got
-				 * freed / rehashed or not.  Since we unhash
-				 * mbcache entry under buffer lock when freeing
-				 * / rehashing xattr block, checking whether
-				 * entry is still hashed is reliable.
+				 * freeing, rehashing or adding references to
+				 * xattr block. Once we hold buffer lock xattr
+				 * block's state is stable so we can check
+				 * whether the block got freed / rehashed or
+				 * not.  Since we unhash mbcache entry under
+				 * buffer lock when freeing / rehashing xattr
+				 * block, checking whether entry is still
+				 * hashed is reliable. Same rules hold for
+				 * e_reusable handling.
 				 */
-				if (hlist_bl_unhashed(&ce->e_hash_list)) {
+				if (hlist_bl_unhashed(&ce->e_hash_list) ||
+				    !ce->e_reusable) {
 					/*
 					 * Undo everything and check mbcache
 					 * again.
@@ -930,14 +952,16 @@ inserted:
 					new_bh = NULL;
 					goto inserted;
 				}
-				le32_add_cpu(&BHDR(new_bh)->h_refcount, 1);
+				ref = le32_to_cpu(BHDR(new_bh)->h_refcount) + 1;
+				BHDR(new_bh)->h_refcount = cpu_to_le32(ref);
+				if (ref >= EXT4_XATTR_REFCOUNT_MAX)
+					ce->e_reusable = 0;
 				ea_bdebug(new_bh, "reusing; refcount now=%d",
-					le32_to_cpu(BHDR(new_bh)->h_refcount));
-				ext4_xattr_block_csum_set(inode, new_bh);
+					  ref);
 				unlock_buffer(new_bh);
-				error = ext4_handle_dirty_metadata(handle,
-								   inode,
-								   new_bh);
+				error = ext4_handle_dirty_xattr_block(handle,
+								      inode,
+								      new_bh);
 				if (error)
 					goto cleanup_dquot;
 			}
@@ -988,12 +1012,11 @@ getblk_failed:
 				goto getblk_failed;
 			}
 			memcpy(new_bh->b_data, s->base, new_bh->b_size);
-			ext4_xattr_block_csum_set(inode, new_bh);
 			set_buffer_uptodate(new_bh);
 			unlock_buffer(new_bh);
 			ext4_xattr_cache_insert(ext4_mb_cache, new_bh);
-			error = ext4_handle_dirty_metadata(handle, inode,
-							   new_bh);
+			error = ext4_handle_dirty_xattr_block(handle,
+							      inode, new_bh);
 			if (error)
 				goto cleanup;
 		}
@@ -1573,11 +1596,14 @@ cleanup:
 static void
 ext4_xattr_cache_insert(struct mb_cache *ext4_mb_cache, struct buffer_head *bh)
 {
-	__u32 hash = le32_to_cpu(BHDR(bh)->h_hash);
+	struct ext4_xattr_header *header = BHDR(bh);
+	__u32 hash = le32_to_cpu(header->h_hash);
+	int reusable = le32_to_cpu(header->h_refcount) <
+		       EXT4_XATTR_REFCOUNT_MAX;
 	int error;
 
 	error = mb_cache_entry_create(ext4_mb_cache, GFP_NOFS, hash,
-				      bh->b_blocknr);
+				      bh->b_blocknr, reusable);
 	if (error) {
 		if (error == -EBUSY)
 			ea_bdebug(bh, "already in cache");
@@ -1652,12 +1678,6 @@ ext4_xattr_cache_find(struct inode *inode, struct ext4_xattr_header *header,
 		if (!bh) {
 			EXT4_ERROR_INODE(inode, "block %lu read error",
 					 (unsigned long) ce->e_block);
-		} else if (le32_to_cpu(BHDR(bh)->h_refcount) >=
-				EXT4_XATTR_REFCOUNT_MAX) {
-			ea_idebug(inode, "block %lu refcount %d>=%d",
-				  (unsigned long) ce->e_block,
-				  le32_to_cpu(BHDR(bh)->h_refcount),
-					  EXT4_XATTR_REFCOUNT_MAX);
 		} else if (ext4_xattr_cmp(header, BHDR(bh)) == 0) {
 			*pce = ce;
 			return bh;
