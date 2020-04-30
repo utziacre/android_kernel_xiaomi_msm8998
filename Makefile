@@ -650,6 +650,7 @@ KBUILD_CFLAGS	+= -mllvm -polly \
 		   -mllvm -polly-detect-keep-going \
 		   -mllvm -polly-vectorizer=stripmine \
 		   -mllvm -polly-invariant-load-hoisting
+KBUILD_CFLAGS	+=	-mcpu=cortex-a53 -mtune=cortex-a53
 else
 KBUILD_CFLAGS	+= -O2
 endif
